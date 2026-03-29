@@ -577,6 +577,181 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// ---------- TurboQuant CUDA FA helpers ----------
+
+// 3-bit centroids for turbo3_0 (N(0,1/128), pre-scaled by 1/sqrt(d))
+static __device__ __forceinline__ float turbo3_centroid(int idx) {
+    constexpr float c[8] = {
+        -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+         0.021460f,  0.065717f,  0.117832f,  0.190685f
+    };
+    return c[idx];
+}
+
+// 4-bit centroids for turbo4_0
+static __device__ __forceinline__ float turbo4_centroid(int idx) {
+    constexpr float c[16] = {
+        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+         0.006938f,  0.020989f,  0.035597f,  0.051262f,
+         0.068756f,  0.089527f,  0.117195f,  0.173926f
+    };
+    return c[idx];
+}
+
+// KQ vec-dot for turbo3_0 K: Q is pre-converted to q8_1 by the FA kernel.
+// Each thread handles sizeof(int)/1 = 4 consecutive (K, Q) element pairs.
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_turbo3_0 * K_t3 = (const block_turbo3_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D / (int)sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ     = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int k_elem_0 = k_KQ * 4;
+
+        const float2 * Q_ds = (const float2 *) Q_ds_v;
+        const float    Q_d  = Q_ds[k_KQ_0 / nthreads].x;
+        const int      q_int = Q_q8[k_KQ_0 / nthreads];
+        const int8_t * q8   = (const int8_t *) &q_int;
+
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int k_elem = k_elem_0 + l;
+            const int ib     = k_elem / QK_TURBO3;
+            const int i      = k_elem % QK_TURBO3;
+
+            const float norm_k = __half2float(K_t3[ib].norm);
+            const int low2     = (K_t3[ib].qs[i / 4] >> ((i % 4) * 2)) & 0x3;
+            const int hi1      = (K_t3[ib].signs[i / 8] >> (i % 8)) & 0x1;
+            const float k_val  = turbo3_centroid(low2 | (hi1 << 2)) * norm_k;
+
+            sum += k_val * ((float)q8[l] * Q_d);
+        }
+    }
+
+    return sum;
+}
+
+// KQ vec-dot for turbo4_0 K (4-bit, TURBO4_USE_4BIT=1, nibble-packed, block size 128).
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_turbo4_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v,
+    const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_turbo4_0 * K_t4 = (const block_turbo4_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D / (int)sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ     = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+        const int k_elem_0 = k_KQ * 4;
+
+        const float2 * Q_ds = (const float2 *) Q_ds_v;
+        const float    Q_d  = Q_ds[k_KQ_0 / nthreads].x;
+        const int      q_int = Q_q8[k_KQ_0 / nthreads];
+        const int8_t * q8   = (const int8_t *) &q_int;
+
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int k_elem   = k_elem_0 + l;
+            const int ib       = k_elem / QK_TURBO4;
+            const int i        = k_elem % QK_TURBO4;
+            const float norm_k = __half2float(K_t4[ib].norm);
+            const uint8_t nibs = K_t4[ib].qs[i / 2];
+            const int idx      = (i % 2 == 0) ? (nibs & 0xF) : (nibs >> 4);
+            const float k_val  = turbo4_centroid(idx) * norm_k;
+
+            sum += k_val * ((float)q8[l] * Q_d);
+        }
+    }
+
+    return sum;
+}
+
+// V dequantize for turbo3_0
+// i0 is always a multiple of 4 (caller contract) and ne == 4, so all elements
+// share one block, one qs byte, and one signs byte.  Hoist those three loads
+// outside the loop: 3 reads instead of 3*ne reads against the 14-byte struct.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo3_0(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+    static_assert(ne % 2 == 0, "bad ne");
+
+    const int64_t ib     = i0 / QK_TURBO3;
+    const int     i_base = (int)(i0 % QK_TURBO3);   // multiple of 4 by caller contract
+
+    const float   norm   = __half2float(x[ib].norm);
+    const uint8_t qs_b   = x[ib].qs[i_base / 4];    // one byte covers 4 consecutive 2-bit slots
+    const uint8_t sgn_b  = x[ib].signs[i_base / 8]; // one byte covers 8 consecutive sign bits
+    const int     sgn_sh = i_base % 8;               // 0 or 4
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const int low2 = (qs_b  >>  (l * 2))        & 0x3;
+        const int hi1  = (sgn_b >> (sgn_sh + l))     & 0x1;
+        const float val = turbo3_centroid(low2 | (hi1 << 2)) * norm;
+
+        if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[l] = val;
+        }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T, half>) {
+            ((half *) dst)[l] = __float2half(val);
+        }
+#endif
+    }
+}
+
+// V dequantize for turbo4_0 (4-bit, nibble-packed)
+// i0 is always a multiple of 4 (caller contract) and ne == 4, so all elements
+// share one block.  Load norm once and the two nibble bytes covering all ne
+// elements as a single uint16 read instead of ne separate byte reads.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_turbo4_0(
+        const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo4_0 * x = (const block_turbo4_0 *) vx;
+    static_assert(ne % 2 == 0, "bad ne");
+
+    const int64_t ib     = i0 / QK_TURBO4;
+    const int     i_base = (int)(i0 % QK_TURBO4);   // multiple of 4; i_base%2 == 0
+
+    const float norm = __half2float(x[ib].norm);
+
+    // ne == 4 elements span exactly 2 nibble bytes; load them as one uint16.
+    uint16_t nibs_u16;
+    memcpy(&nibs_u16, x[ib].qs + i_base / 2, sizeof(uint16_t));
+    const uint8_t nibs0 = (uint8_t)(nibs_u16 & 0xFF);  // elements i_base,   i_base+1
+    const uint8_t nibs1 = (uint8_t)(nibs_u16 >> 8);    // elements i_base+2, i_base+3
+
+#pragma unroll
+    for (int l = 0; l < ne; ++l) {
+        const uint8_t byte = (l < 2) ? nibs0 : nibs1;
+        const int     idx  = (l % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+        const float   val  = turbo4_centroid(idx) * norm;
+
+        if constexpr (std::is_same_v<T, float>) {
+            ((float *) dst)[l] = val;
+        }
+#ifdef FP16_AVAILABLE
+        else if constexpr (std::is_same_v<T, half>) {
+            ((half *) dst)[l] = __float2half(val);
+        }
+#endif
+    }
+}
+
+// ---------- end TurboQuant FA helpers ----------
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -593,6 +768,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
+        return vec_dot_fattn_vec_KQ_turbo3_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+        return vec_dot_fattn_vec_KQ_turbo4_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -615,6 +794,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
+        return dequantize_V_turbo3_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
+        return dequantize_V_turbo4_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

@@ -2052,24 +2052,35 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
+    ggml_tensor * q = q_cur;
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
     // store to KV cache
     {
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
+        // TurboQuant: WHT-rotate v_cur before quantizing into the V cache so that
+        // dequant during flash attention yields WHT(V), and the post-attn inverse WHT
+        // recovers the true attention output.  Only needed when V cache is turbo type.
+        ggml_tensor * v_cur_store = v_cur;
+        if ((v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) &&
+             v_cur->ne[0] % 128 == 0) {
+            if (!ggml_is_contiguous(v_cur_store)) { v_cur_store = ggml_cont(ctx0, v_cur_store); }
+            v_cur_store = ggml_turbo_wht(ctx0, v_cur_store, 0);
+        }
+
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur_store, v_idxs, il));
     }
 
     const auto & kq_mask = inp->get_kq_mask();
 
-    ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
-
     // TurboQuant pre-rotate-queries: O(d log d) WHT rotation via custom op
     // Q shape: (n_embd_head, n_head, n_tokens) — ne[0] divisible by 128
-    // No reshape/cont/matmul needed — the custom kernel handles groups internally
+    // Only rotate Q when K is also turbo (stored in WHT space), so that the
+    // K-Q dot products are preserved: WHT(Q)·WHT(K) = Q·K for orthogonal WHT.
     if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0) {
         if (q->ne[0] % 128 == 0) {
             if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }

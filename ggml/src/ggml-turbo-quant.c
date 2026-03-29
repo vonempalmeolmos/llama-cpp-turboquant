@@ -10,6 +10,9 @@
 #include "ggml-common.h"
 #include "ggml-impl.h"
 
+#ifdef _MSC_VER
+#  define _USE_MATH_DEFINES
+#endif
 #include <math.h>
 #include <string.h>
 #include <assert.h>
@@ -193,15 +196,33 @@ static int nearest_centroid_4bit(float val) {
 /* ---------- TURBO3_0: 2-bit PolarQuant + 1-bit QJL ---------- */
 
 void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
-    // Stub — Metal shader handles quantize on GPU. CPU path is simplified.
+    /* Input x is pre-rotated by the graph-side WHT op; we just scalar-quantize. */
     assert(k % QK_TURBO3 == 0);
     const int nb = k / QK_TURBO3;
-    for (int i = 0; i < nb; i++) {
-        float norm = 0.0f;
-        for (int j = 0; j < QK_TURBO3; j++) norm += x[i*QK_TURBO3 + j] * x[i*QK_TURBO3 + j];
-        y[i].norm = GGML_FP32_TO_FP16(sqrtf(norm));
-        memset(y[i].qs, 0, QK_TURBO3 / 4);
-        memset(y[i].signs, 0, QK_TURBO3 / 8);
+    for (int b = 0; b < nb; b++) {
+        const float * src = x + b * QK_TURBO3;
+        float norm_sq = 0.0f;
+        for (int j = 0; j < QK_TURBO3; j++) norm_sq += src[j] * src[j];
+        const float norm = sqrtf(norm_sq);
+        y[b].norm = GGML_FP32_TO_FP16(norm);
+        memset(y[b].qs,    0, QK_TURBO3 / 4);
+        memset(y[b].signs, 0, QK_TURBO3 / 8);
+        if (norm < 1e-10f) continue;
+        const float inv = 1.0f / norm;
+        for (int j = 0; j < QK_TURBO3; j++) {
+            const float v = src[j] * inv;
+            int idx;
+            if      (v < -0.154259f) idx = 0;
+            else if (v < -0.091775f) idx = 1;
+            else if (v < -0.043589f) idx = 2;
+            else if (v <  0.0f     ) idx = 3;
+            else if (v <  0.043589f) idx = 4;
+            else if (v <  0.091775f) idx = 5;
+            else if (v <  0.154259f) idx = 6;
+            else                     idx = 7;
+            y[b].qs[j / 4]    |= (uint8_t)((idx & 0x3) << ((j % 4) * 2));
+            y[b].signs[j / 8] |= (uint8_t)(((idx >> 2) & 0x1) << (j % 8));
+        }
     }
 }
 

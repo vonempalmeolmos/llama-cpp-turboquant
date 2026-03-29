@@ -1,5 +1,6 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "ggml-common.h"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -309,11 +310,123 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_TURBO3_0) {
+        set_rows_cuda_quant<idx_t, block_turbo3_0, QK_TURBO3, quantize_f32_turbo3_0_block>(
+            src0_d, src1_d, (block_turbo3_0*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_TURBO4_0) {
+        set_rows_cuda_quant<idx_t, block_turbo4_0, QK_TURBO4, quantize_f32_turbo4_0_block>(
+            src0_d, src1_d, (block_turbo4_0*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }
 }
 
+
+// ---- TurboQuant device-side quantize functions for SET_ROWS ----
+
+// Quantize QK_TURBO3=32 pre-rotated floats into one block_turbo3_0.
+// Input x is already WHT-rotated by the graph-side rotation op.
+static __device__ void quantize_f32_turbo3_0_block(const float * __restrict__ src, block_turbo3_0 * __restrict__ dst) {
+    float norm_sq = 0.0f;
+    for (int i = 0; i < QK_TURBO3; i++) norm_sq += src[i] * src[i];
+    const float norm = sqrtf(norm_sq);
+    dst->norm = __float2half(norm);
+
+    uint8_t qs_out[QK_TURBO3 / 4];
+    uint8_t si_out[QK_TURBO3 / 8];
+    for (int i = 0; i < QK_TURBO3 / 4; i++) qs_out[i] = 0;
+    for (int i = 0; i < QK_TURBO3 / 8; i++) si_out[i] = 0;
+
+    if (norm >= 1e-10f) {
+        const float inv = 1.0f / norm;
+        for (int i = 0; i < QK_TURBO3; i++) {
+            const float x = src[i] * inv;
+            int idx;
+            if      (x < -0.154259f) idx = 0;
+            else if (x < -0.091775f) idx = 1;
+            else if (x < -0.043589f) idx = 2;
+            else if (x <  0.0f     ) idx = 3;
+            else if (x <  0.043589f) idx = 4;
+            else if (x <  0.091775f) idx = 5;
+            else if (x <  0.154259f) idx = 6;
+            else                     idx = 7;
+
+            qs_out[i / 4] |= (uint8_t)((idx & 0x3) << ((i % 4) * 2));
+            si_out[i / 8] |= (uint8_t)(((idx >> 2) & 0x1) << (i % 8));
+        }
+    }
+
+    for (int i = 0; i < QK_TURBO3 / 4; i++) dst->qs[i]    = qs_out[i];
+    for (int i = 0; i < QK_TURBO3 / 8; i++) dst->signs[i] = si_out[i];
+}
+
+// Quantize QK_TURBO4=128 pre-rotated floats into one block_turbo4_0 (4-bit, nibble-packed).
+static __device__ void quantize_f32_turbo4_0_block(const float * __restrict__ src, block_turbo4_0 * __restrict__ dst) {
+    constexpr float CENTROIDS[16] = {
+        -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+        -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+         0.006938f,  0.020989f,  0.035597f,  0.051262f,
+         0.068756f,  0.089527f,  0.117195f,  0.173926f
+    };
+
+    float norm_sq = 0.0f;
+    for (int i = 0; i < QK_TURBO4; i++) norm_sq += src[i] * src[i];
+    const float norm = sqrtf(norm_sq);
+
+    uint8_t indices[QK_TURBO4];
+    if (norm < 1e-10f) {
+        dst->norm = 0;
+        for (int i = 0; i < QK_TURBO4 / 2; i++) dst->qs[i] = 0;
+        return;
+    }
+
+    const float inv = 1.0f / norm;
+    for (int i = 0; i < QK_TURBO4; i++) {
+        const float x = src[i] * inv;
+        int idx;
+        if      (x < -0.145560f) idx =  0;
+        else if (x < -0.103361f) idx =  1;
+        else if (x < -0.079142f) idx =  2;
+        else if (x < -0.060009f) idx =  3;
+        else if (x < -0.043430f) idx =  4;
+        else if (x < -0.028293f) idx =  5;
+        else if (x < -0.013963f) idx =  6;
+        else if (x <  0.0f     ) idx =  7;
+        else if (x <  0.013963f) idx =  8;
+        else if (x <  0.028293f) idx =  9;
+        else if (x <  0.043430f) idx = 10;
+        else if (x <  0.060009f) idx = 11;
+        else if (x <  0.079142f) idx = 12;
+        else if (x <  0.103361f) idx = 13;
+        else if (x <  0.145560f) idx = 14;
+        else                     idx = 15;
+        indices[i] = (uint8_t)idx;
+    }
+
+    // Norm correction
+    float recon_sq = 0.0f;
+    for (int i = 0; i < QK_TURBO4; i++) recon_sq += CENTROIDS[indices[i]] * CENTROIDS[indices[i]];
+    const float recon = sqrtf(recon_sq);
+    dst->norm = __float2half((recon > 1e-10f) ? norm / recon : norm);
+
+    for (int i = 0; i < QK_TURBO4; i += 2) dst->qs[i / 2] = indices[i] | (indices[i + 1] << 4);
+}
+
+// ---- end TurboQuant ----
 
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
