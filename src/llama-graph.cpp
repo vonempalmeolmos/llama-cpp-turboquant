@@ -2061,12 +2061,11 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        // TurboQuant: WHT-rotate v_cur before quantizing into the V cache so that
-        // dequant during flash attention yields WHT(V), and the post-attn inverse WHT
-        // recovers the true attention output.  Only needed when V cache is turbo type.
+        // TurboQuant: for TURBO4, WHT-rotate v_cur before the SET_ROWS quantize.
+        // For TURBO3, the WHT is fused into the SET_ROWS CUDA kernel
+        // (k_set_rows_turbo3_wht_quant), eliminating one VRAM round-trip per layer.
         ggml_tensor * v_cur_store = v_cur;
-        if ((v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0) &&
-             v_cur->ne[0] % 128 == 0) {
+        if (v->type == GGML_TYPE_TURBO4_0 && v_cur->ne[0] % 128 == 0) {
             if (!ggml_is_contiguous(v_cur_store)) { v_cur_store = ggml_cont(ctx0, v_cur_store); }
             v_cur_store = ggml_turbo_wht(ctx0, v_cur_store, 0);
         }

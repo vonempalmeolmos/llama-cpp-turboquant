@@ -210,6 +210,17 @@ static void set_rows_cuda(
     }
 }
 
+// Forward declaration — defined below after TurboQuant sign arrays and kernel.
+template<typename idx_t>
+static void set_rows_cuda_turbo3_wht(
+        const float *, const idx_t *, block_turbo3_0 *,
+        int64_t, int64_t, int64_t, int64_t,
+        int64_t, int64_t, int64_t, int64_t,
+        size_t, size_t, size_t,
+        size_t, size_t, size_t,
+        size_t, size_t, size_t,
+        cudaStream_t);
+
 template<typename src_t, typename idx_t>
 static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const src_t * src0_d = (const src_t *)src0->data;
@@ -311,7 +322,7 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             stream
         );
     } else if (dst->type == GGML_TYPE_TURBO3_0) {
-        set_rows_cuda_quant<idx_t, block_turbo3_0, QK_TURBO3, quantize_f32_turbo3_0_block>(
+        set_rows_cuda_turbo3_wht<idx_t>(
             src0_d, src1_d, (block_turbo3_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
@@ -336,10 +347,218 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
 }
 
 
+// ---- TurboQuant fused WHT+quantize kernel for SET_ROWS ----
+
+// Sign arrays duplicated from turbo-wht.cu — static so each CUDA module gets its own copy.
+static __device__ __constant__ float k_sr_wht_s1[128] = {
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1,
+     1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,
+     1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,
+     1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1,
+     1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1
+};
+
+static __device__ __constant__ float k_sr_wht_s2[128] = {
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1,
+     1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
+};
+
+// Fused WHT + turbo3 quantize: one CUDA block (128 threads) per 128-element WHT group.
+// Eliminates the graph-side TURBO_WHT(v_cur) op — WHT is applied in shared memory before
+// packing, saving one full VRAM round-trip per attention layer.
+template<typename idx_t>
+static __global__ void k_set_rows_turbo3_wht_quant(
+        const float       * __restrict__ src0,
+        const idx_t       * __restrict__ src1,
+        block_turbo3_0    * __restrict__ dst,
+        const int64_t  ne_groups,
+        const int64_t  ne10,
+        const int64_t  ne11,
+        const int64_t  ne12,
+        const int64_t  ne13,
+        const int64_t  s01,
+        const int64_t  s02,
+        const int64_t  s03,
+        const int64_t  s10,
+        const int64_t  s11,
+        const int64_t  s12,
+        const int64_t  s1,
+        const int64_t  s2,
+        const int64_t  s3,
+        const uint3    ne00,
+        const uint3    ne01,
+        const uint3    ne02,
+        const uint3    ne11_fd,
+        const uint3    ne12_fd) {
+
+    __shared__ float x[128];
+
+    const int64_t g = blockIdx.x;
+    if (g >= ne_groups) return;
+
+    const int t       = threadIdx.x;   // 0..127
+    const int warp_id = t >> 5;        // 0..3  (warp 0-3 each own one turbo3 block)
+    const int lane    = t & 31;
+
+    // Decompose group base element index → source / dest row addresses
+    const int64_t i_base = g * 128;
+    uint32_t      tmp    = (uint32_t)i_base;
+    uint2         dm;
+
+    dm                = fast_div_modulo(tmp, ne00);
+    const int64_t i00 = dm.y;   // element start within row (multiple of 128)
+    tmp               = dm.x;
+
+    dm                = fast_div_modulo(tmp, ne01);
+    const int64_t i01 = dm.y;
+    tmp               = dm.x;
+
+    dm                = fast_div_modulo(tmp, ne02);
+    const int64_t i02 = dm.y;
+    const int64_t i03 = dm.x;
+
+    const int64_t i12 = fastmodulo((uint32_t)i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t)i02, ne11_fd);
+    const int64_t i10 = i01;
+
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+
+    const float    * src_row = src0 + i01*s01 + i02*s02 + i03*s03;
+    block_turbo3_0 * dst_blk = dst + (dst_row*s1 + i02*s2 + i03*s3) / sizeof(block_turbo3_0)
+                                   + (i00 / QK_TURBO3) + warp_id;
+
+    // ---- WHT in shared memory (identical to k_turbo_wht_f32) ----
+    x[t] = src_row[i00 + t] * k_sr_wht_s1[t];
+    __syncthreads();
+
+    for (int h = 1; h < 128; h <<= 1) {
+        if ((t % (h << 1)) < h) {
+            const float a = x[t];
+            const float b = x[t + h];
+            x[t]     = a + b;
+            x[t + h] = a - b;
+        }
+        __syncthreads();
+    }
+
+    const float x_val = x[t] * 0.08838834764831845f * k_sr_wht_s2[t];
+
+    // ---- Per-warp quantization (warp = 32 threads = one block_turbo3_0) ----
+
+    // Warp-level norm reduction
+    float norm_sq = x_val * x_val;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        norm_sq += __shfl_xor_sync(0xFFFFFFFF, norm_sq, offset);
+    const float norm = sqrtf(norm_sq);
+    const float inv  = (norm >= 1e-10f) ? (1.0f / norm) : 0.0f;
+
+    // Scalar quantize this lane's element
+    int idx = 0;
+    if (inv > 0.0f) {
+        const float v = x_val * inv;
+        if      (v < -0.154259f) idx = 0;
+        else if (v < -0.091775f) idx = 1;
+        else if (v < -0.043589f) idx = 2;
+        else if (v <  0.0f     ) idx = 3;
+        else if (v <  0.043589f) idx = 4;
+        else if (v <  0.091775f) idx = 5;
+        else if (v <  0.154259f) idx = 6;
+        else                     idx = 7;
+    }
+
+    const int low2 = idx & 0x3;
+    const int hi1  = (idx >> 2) & 0x1;
+
+    // Pack 32 sign bits via __ballot_sync
+    const uint32_t sign_mask = __ballot_sync(0xFFFFFFFF, hi1);
+    // Pack 32 pairs of 2-bit indices: bit0 plane and bit1 plane separately
+    const uint32_t qs_bit0   = __ballot_sync(0xFFFFFFFF, low2 & 1);
+    const uint32_t qs_bit1   = __ballot_sync(0xFFFFFFFF, (low2 >> 1) & 1);
+
+    if (lane == 0) {
+        dst_blk->norm = __float2half(norm);
+
+        // signs[4]: 32-bit mask → 4 bytes
+        dst_blk->signs[0] = (uint8_t)((sign_mask >>  0) & 0xFF);
+        dst_blk->signs[1] = (uint8_t)((sign_mask >>  8) & 0xFF);
+        dst_blk->signs[2] = (uint8_t)((sign_mask >> 16) & 0xFF);
+        dst_blk->signs[3] = (uint8_t)((sign_mask >> 24) & 0xFF);
+
+        // qs[8]: each byte packs 4 elements' 2-bit indices
+        // Element k*4+j → bits j*2+0 (from qs_bit0) and j*2+1 (from qs_bit1) in byte k
+#pragma unroll
+        for (int k = 0; k < 8; k++) {
+            const uint8_t n0 = (uint8_t)((qs_bit0 >> (k * 4)) & 0xF);
+            const uint8_t n1 = (uint8_t)((qs_bit1 >> (k * 4)) & 0xF);
+            uint8_t byte_k = 0;
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                byte_k |= (uint8_t)(((n0 >> j) & 1) << (j * 2));
+                byte_k |= (uint8_t)(((n1 >> j) & 1) << (j * 2 + 1));
+            }
+            dst_blk->qs[k] = byte_k;
+        }
+    }
+
+    GGML_UNUSED(ne10);
+    GGML_UNUSED(ne11);
+    GGML_UNUSED(ne12);
+    GGML_UNUSED(ne13);
+}
+
+template<typename idx_t>
+static void set_rows_cuda_turbo3_wht(
+        const float * src0_d, const idx_t * src1_d, block_turbo3_0 * dst_d,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+
+    GGML_ASSERT(ne00 % 128 == 0);
+    const int64_t ne_groups = (ne00 * ne01 * ne02 * ne03) / 128;
+    if (ne_groups == 0) return;
+
+    const int64_t s01 = nb01 / sizeof(float);
+    const int64_t s02 = nb02 / sizeof(float);
+    const int64_t s03 = nb03 / sizeof(float);
+    const int64_t s10 = nb10 / sizeof(idx_t);
+    const int64_t s11 = nb11 / sizeof(idx_t);
+    const int64_t s12 = nb12 / sizeof(idx_t);
+    const int64_t s1  = nb1;
+    const int64_t s2  = nb2;
+    const int64_t s3  = nb3;
+
+    if (ne_groups > 0 && ne00 > 0 && ne01 > 0 && ne02 > 0 && ne11 > 0 && ne12 > 0) {
+        const uint3 ne00_fd = init_fastdiv_values((uint32_t)ne00);
+        const uint3 ne01_fd = init_fastdiv_values((uint32_t)ne01);
+        const uint3 ne02_fd = init_fastdiv_values((uint32_t)ne02);
+        const uint3 ne11_fd = init_fastdiv_values((uint32_t)ne11);
+        const uint3 ne12_fd = init_fastdiv_values((uint32_t)ne12);
+
+        k_set_rows_turbo3_wht_quant<idx_t><<<(unsigned)ne_groups, 128, 0, stream>>>(
+            src0_d, src1_d, dst_d, ne_groups,
+            ne10, ne11, ne12, ne13,
+            s01, s02, s03, s10, s11, s12, s1, s2, s3,
+            ne00_fd, ne01_fd, ne02_fd, ne11_fd, ne12_fd);
+    }
+}
+
 // ---- TurboQuant device-side quantize functions for SET_ROWS ----
 
 // Quantize QK_TURBO3=32 pre-rotated floats into one block_turbo3_0.
-// Input x is already WHT-rotated by the graph-side rotation op.
+// Input x is already WHT-rotated (used only when falling back to the non-fused path).
 static __device__ void quantize_f32_turbo3_0_block(const float * __restrict__ src, block_turbo3_0 * __restrict__ dst) {
     float norm_sq = 0.0f;
     for (int i = 0; i < QK_TURBO3; i++) norm_sq += src[i] * src[i];
