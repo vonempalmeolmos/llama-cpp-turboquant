@@ -383,24 +383,39 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
             break;
-        case GGML_TYPE_TURBO3_0:
         case GGML_TYPE_TURBO4_0:
-            // TurboQuant types only have a VEC kernel; check head dim and stride compatibility inline.
+            // TURBO4 only has a VEC kernel path.
             if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
                 return BEST_FATTN_KERNEL_VEC;
             }
             return BEST_FATTN_KERNEL_NONE;
+        case GGML_TYPE_TURBO3_0:
+            // TURBO3 K: decode uses VEC (inline dequant); prefill falls through to MMA dispatch.
+            // launch_fattn will convert K+V to F16 via need_f16_K/V=true.
+            if (!(Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0)) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+            if (Q->ne[1] <= 2) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
+            break; // prefill: fall through to hardware-appropriate dispatch
         default:
             return BEST_FATTN_KERNEL_NONE;
     }
 
     // Handle turbo V type with a non-turbo K type (e.g. K=f16, V=turbo3).
-    // Must be checked after the K switch so turbo K types are already handled above.
+    // Also reached when K=TURBO3 prefill fell through the switch above.
     if (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0) {
-        if (Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0) {
+        if (!(Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        if (V->type == GGML_TYPE_TURBO4_0 || Q->ne[1] <= 2) {
+            // Decode (small Q batch) or TURBO4: use VEC kernel — no V conversion needed,
+            // dequant happens inline inside the VEC kernel.
             return BEST_FATTN_KERNEL_VEC;
         }
-        return BEST_FATTN_KERNEL_NONE;
+        // TURBO3 prefill (Q->ne[1] > 2): fall through to hardware-appropriate dispatch.
+        // launch_fattn converts K+V to F16 via need_f16_K=true / need_f16_V=true.
     }
 
     if (mask && mask->ne[2] != 1) {

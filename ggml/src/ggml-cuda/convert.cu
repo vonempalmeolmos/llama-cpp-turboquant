@@ -698,6 +698,31 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
+// ---- TurboQuant TURBO3_0 → FP16 dequantization ----
+// Decodes two consecutive elements (iqs, iqs+1) from block ib into v.x and v.y.
+// iqs is always even (dequantize_block iterates i00 = 2*threadIdx), so both elements
+// share the same qs byte and the same signs byte.
+static __device__ __forceinline__ void dequantize_turbo3_0(
+        const void * __restrict__ vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+    constexpr float c[8] = {
+        -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+         0.021460f,  0.065717f,  0.117832f,  0.190685f
+    };
+    const float   norm = __half2float(x[ib].norm);
+    const uint8_t qs_b = x[ib].qs[iqs / 4];
+    const uint8_t sg_b = x[ib].signs[iqs / 8];
+    const int sh = (iqs % 4) * 2;
+
+    v.x = c[((qs_b >> sh)       & 0x3) | (((sg_b >> (iqs % 8))     & 0x1) << 2)] * norm;
+    v.y = c[((qs_b >> (sh + 2)) & 0x3) | (((sg_b >> (iqs % 8 + 1)) & 0x1) << 2)] * norm;
+}
+
+static void dequantize_row_turbo3_0_cuda(
+        const void * __restrict__ vx, half * __restrict__ y, const int64_t k, cudaStream_t stream) {
+    dequantize_block_cont_cuda<QK_TURBO3, 1, dequantize_turbo3_0, half>(vx, y, k, stream);
+}
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -756,6 +781,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return dequantize_row_mxfp4_cuda;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_cuda;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_cuda;
         case GGML_TYPE_F32:
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
@@ -832,6 +859,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_block_cuda<QK_TURBO3, 1, dequantize_turbo3_0>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
         default:

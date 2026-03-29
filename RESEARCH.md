@@ -104,14 +104,84 @@ For RTX 3080 decoding at 32K context (bandwidth-bound regime):
 
 ---
 
-## Optimization Roadmap
+## What We Actually Built — Implementation Log
 
-| Optimization | Complexity | Expected gain | Who |
-|---|---|---|---|
-| Vectorized 14B block reads in dequant | Low — self-contained CUDA | 2–4× on dequant path | Doable locally |
-| Fuse Q/output WHT into fattn kernel | Medium — touches fattn template | Moderate prefill, small decode | Community / local |
-| Fuse V WHT into SET_ROWS kernel | Medium | Moderate prefill | Community / local |
-| Google releases Triton kernels | — | Full H100 gains portable | Google |
+### Optimization 1: Vectorized block reads in dequantize_V_turbo3_0 ✓ DONE — 2.3× speedup
+
+**Problem.** `block_turbo3_0` is 14 bytes wide. The original `dequantize_V_turbo3_0` reloaded `.norm`, `.qs[i/4]`, and `.signs[i/8]` inside the hot loop — 12 separate byte-granularity loads per 4-element call. Non-power-of-2 stride means no vectorization and warp-level memory inefficiency.
+
+**Fix.** Hoist `ib`, `norm`, `qs_b`, and `sgn_b` outside the inner loop. All 4 elements dequantized from 3 register values already in flight. File: `ggml/src/ggml-cuda/fattn-common.cuh`.
+
+**Measured result.** `/init` command on Qwen 9B, RTX 3080, 32K context: 8 min → 3.5 min (~2.3× speedup on the dequant path).
+
+---
+
+### Optimization 2: Fuse TURBO_WHT(v_cur) into SET_ROWS quantize kernel ✓ DONE — no measurable gain
+
+**Rationale at the time.** The graph-side `ggml_turbo_wht(v_cur, forward)` op ran before `cpy_v`, causing one extra VRAM round-trip per attention layer during prefill. Fusing it into the SET_ROWS quantize kernel should eliminate that round-trip.
+
+**What was built.** `k_set_rows_turbo3_wht_quant<idx_t>` in `ggml/src/ggml-cuda/set-rows.cu`: 128 threads/block, one CUDA block per 128-element WHT group. WHT butterfly runs in shared memory; per-warp norm reduction via `__shfl_xor_sync`; signs packed via `__ballot_sync`; qs packed via two `__ballot_sync` bit-plane calls + interleave. Graph-side `ggml_turbo_wht` removed for TURBO3 (kept for TURBO4 which has no fused path yet).
+
+**Measured result.** Still 3.5 min. No measurable change.
+
+**Why.** The fused kernel only affects the *write* side — new tokens being packed into the V cache during prefill. The time is dominated by the *read* side: every decode step reads the entire TURBO3 V cache and dequantizes it inside `flash_attn_ext_vec`. The write path is a one-time cost per token; the read path runs for every token generated.
+
+---
+
+### Root cause analysis: the real bottleneck is VEC-kernel-for-prefill
+
+For K=F16, V=TURBO3, `ggml_cuda_get_best_fattn_kernel` hard-returns `BEST_FATTN_KERNEL_VEC` for **all** Q batch sizes:
+
+```cpp
+if (V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0) {
+    if (Q->ne[0] <= 256 && ...) return BEST_FATTN_KERNEL_VEC;  // always, even for prefill
+}
+```
+
+The VEC kernel processes **2 query tokens per CUDA block**. Stock llama-server on RTX 3080 (sm_86, Ampere tensor cores) uses the MMA_F16 kernel which processes **32–64 tokens per block** using tensor cores. For a 4K-token prefill:
+
+| Kernel | Blocks per layer | Total blocks (32 layers) |
+|--------|-----------------|--------------------------|
+| VEC (ncols=2) | 2000 | 64,000 |
+| MMA (ncols=32) | 125 | 4,000 |
+
+That is ~16× more kernel launches plus no tensor core utilization. For a 10K-token `/init` prompt the multiplier is larger.
+
+**Estimated split of the 3.5-minute total** (rough, RTX 3080, Qwen 9B, 32K context):
+- Prefill VEC overhead vs MMA: ~2–2.5× slower than stock → ~2 min penalty
+- Decode dequant overhead (partially fixed in Opt 1): ~1 min
+- WHT graph ops: ~0.3 s across all tokens — negligible
+
+---
+
+### Optimization 3: TURBO3 K+V → F16 temp buffers + MMA kernel for prefill ✓ DONE — pending measurement
+
+**Problem.** `ggml_cuda_get_best_fattn_kernel` unconditionally returned `BEST_FATTN_KERNEL_VEC` for any attention call where K or V was a TURBO type. The VEC kernel processes 2 query tokens per CUDA block. On Ampere/RTX 3080, stock llama-server uses the MMA_F16 kernel (tensor cores, 32–64 tokens per block). For a 4K-token prefill this gap is ~16× in block count, plus tensor core utilization.
+
+**What was built.**
+1. `dequantize_turbo3_0` device function in `ggml/src/ggml-cuda/convert.cu` — follows the standard `dequantize_kernel_t` interface, decodes 2 consecutive TURBO3 elements (sharing one qs byte and one signs byte) into a `float2`.
+2. `dequantize_row_turbo3_0_cuda` contiguous wrapper registered in `ggml_get_to_fp16_cuda(GGML_TYPE_TURBO3_0)`.
+3. `dequantize_block_cuda<QK_TURBO3, 1, dequantize_turbo3_0>` registered in `ggml_get_to_fp16_nc_cuda(GGML_TYPE_TURBO3_0)` for non-contiguous tensors.
+4. Dispatch change in `ggml_cuda_get_best_fattn_kernel` (`fattn.cu`): for TURBO3 K and `Q->ne[1] > 2` (prefill), the K-type switch breaks instead of returning VEC, falling through to the hardware-appropriate selector. On Ampere this returns `BEST_FATTN_KERNEL_MMA_F16`. The MMA dispatch calls `launch_fattn` with `need_f16_K=true, need_f16_V=true`, which decompresses both K and V from TURBO3 to F16 pool-allocated temp buffers; the MMA kernel sees plain F16.
+5. Decode path (`Q->ne[1] <= 2`) and TURBO4 are unchanged — still use the VEC kernel with inline dequant.
+
+**Bug found and fixed after first build.** The initial dispatch change only added a fallthrough check for the V-type guard block (covering K=F16, V=TURBO3). In practice both K and V are stored as TURBO3, so the K-type switch case `GGML_TYPE_TURBO3_0` fired first and returned VEC unconditionally — the V-type block was never reached. Measured result after first build: still 3.5 min (no change). Fix: split `GGML_TYPE_TURBO3_0` and `GGML_TYPE_TURBO4_0` into separate switch cases; TURBO3 now breaks to MMA for prefill, TURBO4 keeps the original VEC-only path.
+
+**Why the temp-buffer approach works.** Both K and V caches store WHT-rotated TURBO3 values. The F16 temp buffers contain the same WHT-rotated values, now in F16. The MMA kernel computes `Σ w_j · WHT(V_j)`. The post-attention graph-side `inv_WHT` op recovers `Σ w_j · V_j` exactly as before. Correctness is preserved.
+
+**Temp buffer cost.** For a 32K context, 8 KV heads, D=128: K buffer ~64 MB + V buffer ~64 MB = ~128 MB of F16 from the CUDA pool (pointer-bump, no malloc). At 760 GB/s this takes ~0.17 ms per prefill chunk — negligible compared to the attention compute savings.
+
+**Measured result.** TBD — pending rebuild and test.
+
+---
+
+## Remaining Optimization Roadmap
+
+| Optimization | Complexity | Expected gain |
+|---|---|---|
+| Fuse output inv-WHT into fattn / flash_attn_combine_results | High: parallel_blocks and stream-k cases both need separate handling | <1% gain — not worth it |
+| Native TURBO3 MMA kernel (no temp buffer conversion) | Very high | Marginal vs temp-buffer approach for most contexts |
+| Google releases Triton kernels | — | Full H100 gains portable |
 
 ---
 
